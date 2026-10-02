@@ -1,0 +1,93 @@
+# Fork-only release: build Linux (static) and macOS binaries and publish them
+# as a GitHub release of this repository, in the layout install.sh expects
+# (codebase-memory-mcp-<os>-<arch>[-portable].tar.gz + checksums.txt).
+#
+# Trigger: push a v-prefixed tag (git push origin v0.11.0-514.4), or run it
+# manually from the Actions tab on a tag.
+name: Fork release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'antespi/codebase-memory-mcp'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64-portable
+            build_args: CC=gcc CXX=g++ STATIC=1
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64-portable
+            build_args: CC=gcc CXX=g++ STATIC=1
+          - os: macos-14
+            goos: darwin
+            goarch: arm64
+            build_args: CC=cc CXX=c++
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            build_args: CC=cc CXX=c++
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install deps (Ubuntu)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Build
+        run: scripts/build.sh --with-ui --version "${GITHUB_REF_NAME}" ${{ matrix.build_args }}
+
+      - name: Strip/sign candidate and package
+        run: |
+          scripts/ci/prepare-release-candidates.sh "${{ matrix.goos }}" "${{ matrix.goarch }}" \
+            --binary build/c/codebase-memory-mcp --out-dir release-candidates
+          bin="release-candidates/${{ matrix.goos }}-${{ matrix.goarch }}/stripped/codebase-memory-mcp"
+          "$bin" --version
+          if command -v sha256sum >/dev/null; then sha=$(sha256sum "$bin" | awk '{print $1}');
+          else sha=$(shasum -a 256 "$bin" | awk '{print $1}'); fi
+          mkdir -p dist
+          VERSION="${GITHUB_REF_NAME}" scripts/package-release.sh "${{ matrix.goos }}" "${{ matrix.goarch }}" \
+            --selected-binary "$bin" --expected-sha256 "$sha" --out-dir dist
+          ls -la dist
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.tar.gz
+
+  release:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd dist
+          sha256sum *.tar.gz > checksums.txt
+          cat checksums.txt
+          gh release create "${GITHUB_REF_NAME}" *.tar.gz checksums.txt \
+            --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --generate-notes
